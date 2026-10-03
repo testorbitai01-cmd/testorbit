@@ -1,0 +1,65 @@
+@import 'tailwindcss';
+
+/* Design tokens — electric blue accent, white surfaces, navy text. */
+@theme {
+  --font-sans: 'Inter Variable', ui-sans-serif, system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif;
+  --font-mono: ui-monospace, 'SFMono-Regular', 'Cascadia Code', 'JetBrains Mono', Menlo, Consolas, monospace;
+
+  --color-brand-50: #eff5ff;
+  --color-brand-100: #dbe8fe;
+  --color-brand-200: #bfd6fe;
+  --color-brand-300: #93bbfd;
+  --color-brand-400: #6098fa;
+  --color-brand-500: #3b76f6;
+  --color-brand-600: #2563eb;
+  --color-brand-700: #1d4fd7;
+  --color-brand-800: #1e40af;
+  --color-brand-900: #1e3a8a;
+
+  --color-navy-950: #0b1220;
+  --color-navy-900: #111a2e;
+  --color-navy-800: #1a2540;
+  --color-navy-700: #283556;
+
+  --color-surface: #ffffff;
+  --color-canvas: #f3f6fb;
+  --color-line: #e3e8f1;
+  --color-line-strong: #cfd7e4;
+  --color-ink: #0b1220;
+  --color-ink-muted: #4a5670;
+  --color-ink-subtle: #6b7690;
+
+  --radius-card: 0.875rem;
+  --shadow-card: 0 1px 2px rgb(11 18 32 / 0.04), 0 1px 3px rgb(11 18 32 / 0.06);
+  --shadow-raised: 0 8px 24px -6px rgb(11 18 32 / 0.12), 0 2px 6px rgb(11 18 32 / 0.06);
+}
+
+@layer base {
+  html {
+    -webkit-text-size-adjust: 100%;
+  }
+  body {
+    @apply bg-canvas text-ink font-sans antialiased;
+    font-feature-settings: 'cv11', 'ss01';
+  }
+  :focus-visible {
+    outline: 2px solid var(--color-brand-600);
+    outline-offset: 2px;
+  }
+  ::selection {
+    background: var(--color-brand-200);
+  }
+  dialog::backdrop {
+    background: rgb(11 18 32 / 0.55);
+    backdrop-filter: blur(2px);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    transition-duration: 0.01ms !important;
+  }
+}

@@ -1,0 +1,47 @@
+{
+  "name": "test-orbit",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Test Orbit \u00e2\u20ac\u201d campus recruitment assessment portal",
+  "workspaces": [
+    "shared",
+    "server",
+    "client"
+  ],
+  "engines": {
+    "node": ">=20.19"
+  },
+  "scripts": {
+    "dev": "concurrently -n server,client -c blue,magenta \"npm run dev -w server\" \"npm run dev -w client\"",
+    "build": "npm run prisma:generate && npm run build -w client && npm run build -w server",
+    "start": "npm run start -w server",
+    "test": "npm run test -w shared && npm run test -w server && npm run test -w client",
+    "lint": "eslint .",
+    "typecheck": "npm run typecheck -w shared && npm run typecheck -w server && npm run typecheck -w client",
+    "prisma:generate": "prisma generate",
+    "db:migrate": "prisma migrate dev",
+    "db:deploy": "prisma migrate deploy",
+    "db:seed": "prisma db seed",
+    "admin:bootstrap": "npm run admin:bootstrap -w server",
+    "railway:release": "prisma migrate deploy && prisma db seed && npm run admin:bootstrap"
+  },
+  "prisma": {
+    "schema": "prisma/schema.prisma",
+    "seed": "tsx prisma/seed.ts"
+  },
+  "devDependencies": {
+    "@eslint/js": "^9.39.0",
+    "concurrently": "^9.2.0",
+    "eslint": "^9.39.0",
+    "eslint-plugin-react-hooks": "^5.2.0",
+    "globals": "^16.0.0",
+    "typescript": "~5.9.3",
+    "typescript-eslint": "^8.46.0"
+  },
+  "dependencies": {
+    "@prisma/client": "6.19.3",
+    "prisma": "6.19.3",
+    "tsx": "^4.20.0"
+  },
+  "type": "module"
+}

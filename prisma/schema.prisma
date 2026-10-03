@@ -1,0 +1,532 @@
+// Test Orbit — PostgreSQL schema (Prisma 6).
+//
+// Conventions
+//  • All timestamps are stored in UTC (`timestamptz`).
+//  • Assessment records are protected with `onDelete: Restrict` from the
+//    student/paper/question side so that deleting master data can never
+//    silently remove assessment history.
+//  • Marks use DECIMAL(6,2).
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ───────────────────────────── Enums ─────────────────────────────
+
+enum AdminRole {
+  ADMIN
+  REVIEWER
+}
+
+enum QuestionType {
+  MCQ
+  CODING
+}
+
+enum Difficulty {
+  EASY
+  MEDIUM
+  HARD
+}
+
+enum GradeType {
+  PERCENTAGE
+  CGPA_10
+  CGPA_4
+  GPA_5
+}
+
+enum EducationLevel {
+  SSC
+  HSC
+  UG
+  PG
+}
+
+enum SessionStatus {
+  CREATED
+  IN_PROGRESS
+  INTERRUPTED
+  FLAGGED_FOR_REVIEW
+  SUBMITTED
+  EXPIRED
+  TERMINATED
+}
+
+enum ProctoringEventType {
+  TAB_HIDDEN
+  WINDOW_BLUR
+  CAMERA_DISCONNECTED
+  MICROPHONE_DISCONNECTED
+  NETWORK_OFFLINE
+  NETWORK_RESTORED
+  PAGE_UNLOAD
+  MULTIPLE_FACES_DETECTED
+  FACE_NOT_VISIBLE
+  SPEECH_DETECTED
+  CAMERA_MONITORING_UNAVAILABLE
+  MICROPHONE_MONITORING_UNAVAILABLE
+  SESSION_TERMINATED
+  SESSION_INTERRUPTED
+  SESSION_RESUMED
+}
+
+enum EventAction {
+  LOGGED
+  WARNING
+  TERMINATED
+  IGNORED
+}
+
+enum ReentryStatus {
+  PENDING
+  APPROVED
+  REJECTED
+  USED
+  CANCELLED
+}
+
+enum ReentryTrigger {
+  NETWORK_INTERRUPTION
+  POLICY_TERMINATION
+}
+
+enum EvaluationStatus {
+  NOT_EVALUATED
+  PENDING_MANUAL_REVIEW
+  COMPLETE
+}
+
+// ───────────────────────────── Admins ─────────────────────────────
+
+model AdminUser {
+  id                 String    @id @default(cuid())
+  email              String    @unique
+  name               String
+  passwordHash       String
+  role               AdminRole @default(ADMIN)
+  isActive           Boolean   @default(true)
+  /// True for the bootstrap account (and admin-created accounts) until the password is changed.
+  mustChangePassword Boolean   @default(false)
+  failedLoginCount   Int       @default(0)
+  lockedUntil        DateTime? @db.Timestamptz(3)
+  lastLoginAt        DateTime? @db.Timestamptz(3)
+  passwordChangedAt  DateTime? @db.Timestamptz(3)
+  createdAt          DateTime  @default(now()) @db.Timestamptz(3)
+  updatedAt          DateTime  @updatedAt @db.Timestamptz(3)
+
+  sessions         AdminSession[]
+  auditLogs        AdminAuditLog[]
+  reentryDecisions ReentryRequest[]  @relation("ReentryDecidedBy")
+  evaluations      SessionQuestion[] @relation("EvaluatedBy")
+  questions        Question[]        @relation("QuestionCreatedBy")
+  papers           QuestionPaper[]   @relation("PaperCreatedBy")
+}
+
+/// Server-side admin session. Only a SHA-256 hash of the cookie token is stored.
+model AdminSession {
+  id         String    @id @default(cuid())
+  tokenHash  String    @unique
+  adminId    String
+  admin      AdminUser @relation(fields: [adminId], references: [id], onDelete: Cascade)
+  createdAt  DateTime  @default(now()) @db.Timestamptz(3)
+  lastSeenAt DateTime  @default(now()) @db.Timestamptz(3)
+  expiresAt  DateTime  @db.Timestamptz(3)
+  ipAddress  String?
+  userAgent  String?
+
+  @@index([adminId])
+  @@index([expiresAt])
+}
+
+model AdminAuditLog {
+  id         String     @id @default(cuid())
+  adminId    String?
+  admin      AdminUser? @relation(fields: [adminId], references: [id], onDelete: SetNull)
+  action     String
+  entityType String
+  entityId   String?
+  details    Json?
+  ipAddress  String?
+  userAgent  String?
+  createdAt  DateTime   @default(now()) @db.Timestamptz(3)
+
+  @@index([createdAt])
+  @@index([entityType, entityId])
+  @@index([adminId])
+  @@index([action])
+}
+
+model SystemSetting {
+  key         String   @id
+  value       Json
+  updatedById String?
+  updatedAt   DateTime @updatedAt @db.Timestamptz(3)
+}
+
+// ───────────────────────────── Students ─────────────────────────────
+
+model Domain {
+  id        String   @id @default(cuid())
+  slug      String   @unique
+  name      String   @unique
+  isActive  Boolean  @default(true)
+  createdAt DateTime @default(now()) @db.Timestamptz(3)
+  updatedAt DateTime @updatedAt @db.Timestamptz(3)
+
+  students  Student[]
+  questions Question[]
+  papers    QuestionPaper[]
+}
+
+model Student {
+  id                     String    @id @default(cuid())
+  fullName               String
+  registrationNumber     String    @unique
+  mobileNumber           String    @unique
+  collegeEmail           String    @unique
+  personalEmail          String    @unique
+  collegeName            String
+  location               String
+  department             String
+  yearOfPassing          Int
+  domainId               String
+  domain                 Domain    @relation(fields: [domainId], references: [id], onDelete: Restrict)
+  /// Set when the first assessment session starts; the domain cannot change afterwards.
+  domainLockedAt         DateTime? @db.Timestamptz(3)
+  deviceCheckCompletedAt DateTime? @db.Timestamptz(3)
+  deviceCheckDetails     Json?
+  /// Set when an admin deletes a student who has assessment history: hidden from the
+  /// student list and unable to sign in, while results, events and audit records stay intact.
+  archivedAt             DateTime? @db.Timestamptz(3)
+  createdAt              DateTime  @default(now()) @db.Timestamptz(3)
+  updatedAt              DateTime  @updatedAt @db.Timestamptz(3)
+
+  education      EducationRecord[]
+  authSessions   StudentAuthSession[]
+  sessions       AssessmentSession[]
+  identityPhotos IdentityPhoto[]
+  events         ProctoringEvent[]
+  reentries      ReentryRequest[]
+
+  @@index([fullName])
+  @@index([collegeName])
+  @@index([department])
+  @@index([yearOfPassing])
+  @@index([domainId])
+  @@index([createdAt])
+  @@index([archivedAt])
+}
+
+/// Server-side student session (HTTP-only cookie). Only a hash of the token is stored.
+model StudentAuthSession {
+  id         String   @id @default(cuid())
+  tokenHash  String   @unique
+  studentId  String
+  student    Student  @relation(fields: [studentId], references: [id], onDelete: Cascade)
+  createdAt  DateTime @default(now()) @db.Timestamptz(3)
+  lastSeenAt DateTime @default(now()) @db.Timestamptz(3)
+  expiresAt  DateTime @db.Timestamptz(3)
+  ipAddress  String?
+  userAgent  String?
+
+  @@index([studentId])
+  @@index([expiresAt])
+}
+
+model EducationRecord {
+  id               String         @id @default(cuid())
+  studentId        String
+  student          Student        @relation(fields: [studentId], references: [id], onDelete: Cascade)
+  level            EducationLevel
+  institutionName  String
+  yearOfCompletion Int
+  major            String?
+  gradeType        GradeType
+  score            Decimal        @db.Decimal(6, 2)
+  createdAt        DateTime       @default(now()) @db.Timestamptz(3)
+  updatedAt        DateTime       @updatedAt @db.Timestamptz(3)
+
+  @@unique([studentId, level])
+}
+
+/// Metadata for an explicitly confirmed identity photo. The image bytes live in
+/// the configured storage driver (see server/src/lib/storage.ts), never in this table.
+model IdentityPhoto {
+  id             String    @id @default(cuid())
+  studentId      String
+  student        Student   @relation(fields: [studentId], references: [id], onDelete: Cascade)
+  storageDriver  String
+  storageKey     String
+  mimeType       String
+  sizeBytes      Int
+  sha256         String
+  confirmedAt    DateTime  @db.Timestamptz(3)
+  retentionUntil DateTime  @db.Timestamptz(3)
+  deletedAt      DateTime? @db.Timestamptz(3)
+  createdAt      DateTime  @default(now()) @db.Timestamptz(3)
+
+  @@index([studentId])
+  @@index([retentionUntil])
+}
+
+// ───────────────────────────── Question bank ─────────────────────────────
+
+model Question {
+  id            String       @id @default(cuid())
+  domainId      String
+  domain        Domain       @relation(fields: [domainId], references: [id], onDelete: Restrict)
+  /// Section identifier (e.g. "A", "F", "SQL"); matched against PaperSection.key.
+  section       String
+  type          QuestionType
+  text          String
+  marks         Decimal      @db.Decimal(6, 2)
+  negativeMarks Decimal      @default(0) @db.Decimal(6, 2)
+  difficulty    Difficulty   @default(MEDIUM)
+  /// Admin-only. Never sent to students.
+  explanation   String?
+  isActive      Boolean      @default(true)
+  /// Optional author-supplied stable identifier (e.g. "AIML-A-001").
+  externalRef   String?
+  /// Set when an admin deletes a question that is referenced by assessment history:
+  /// it is hidden from the bank and excluded from every pool, but kept for results.
+  archivedAt    DateTime?    @db.Timestamptz(3)
+  /// SHA-256 of normalised content, used to skip duplicate imports.
+  contentHash   String
+  createdById   String?
+  createdBy     AdminUser?   @relation("QuestionCreatedBy", fields: [createdById], references: [id], onDelete: SetNull)
+  createdAt     DateTime     @default(now()) @db.Timestamptz(3)
+  updatedAt     DateTime     @updatedAt @db.Timestamptz(3)
+
+  options          QuestionOption[]
+  sessionQuestions SessionQuestion[]
+
+  @@unique([domainId, externalRef])
+  @@index([domainId, section, type, isActive])
+  @@index([contentHash])
+}
+
+model QuestionOption {
+  id         String   @id @default(cuid())
+  questionId String
+  question   Question @relation(fields: [questionId], references: [id], onDelete: Cascade)
+  text       String
+  /// Admin-only. Never sent to students.
+  isCorrect  Boolean  @default(false)
+  position   Int
+  createdAt  DateTime @default(now()) @db.Timestamptz(3)
+  updatedAt  DateTime @updatedAt @db.Timestamptz(3)
+
+  @@index([questionId])
+}
+
+// ───────────────────────────── Papers ─────────────────────────────
+
+model QuestionPaper {
+  id                     String     @id @default(cuid())
+  name                   String
+  description            String     @default("")
+  domainId               String
+  domain                 Domain     @relation(fields: [domainId], references: [id], onDelete: Restrict)
+  durationMinutes        Int        @default(45)
+  shuffleOptions         Boolean    @default(true)
+  negativeMarkingEnabled Boolean    @default(false)
+  /// At most one active paper per domain (enforced in the service layer).
+  isActive               Boolean    @default(false)
+  createdById            String?
+  createdBy              AdminUser? @relation("PaperCreatedBy", fields: [createdById], references: [id], onDelete: SetNull)
+  createdAt              DateTime   @default(now()) @db.Timestamptz(3)
+  updatedAt              DateTime   @updatedAt @db.Timestamptz(3)
+
+  sections PaperSection[]
+  sessions AssessmentSession[]
+
+  @@index([domainId, isActive])
+}
+
+model PaperSection {
+  id                       String        @id @default(cuid())
+  paperId                  String
+  paper                    QuestionPaper @relation(fields: [paperId], references: [id], onDelete: Cascade)
+  /// Stable section identifier within the paper (any number of sections).
+  key                      String
+  title                    String
+  position                 Int
+  questionCount            Int
+  /// null ⇒ use each question's own marks.
+  marksPerQuestion         Decimal?      @db.Decimal(6, 2)
+  /// null ⇒ use each question's own negative marks.
+  negativeMarksPerQuestion Decimal?      @db.Decimal(6, 2)
+
+  @@unique([paperId, key])
+}
+
+// ───────────────────────────── Assessment ─────────────────────────────
+
+model AssessmentSession {
+  id                    String           @id @default(cuid())
+  studentId             String
+  student               Student          @relation(fields: [studentId], references: [id], onDelete: Restrict)
+  paperId               String
+  paper                 QuestionPaper    @relation(fields: [paperId], references: [id], onDelete: Restrict)
+  attemptNumber         Int              @default(1)
+  status                SessionStatus    @default(CREATED)
+  /// Snapshot of the paper duration at start.
+  durationMinutes       Int
+  startedAt             DateTime?        @db.Timestamptz(3)
+  /// Authoritative deadline while IN_PROGRESS.
+  deadlineAt            DateTime?        @db.Timestamptz(3)
+  /// Remaining time captured when the session was paused (INTERRUPTED / FLAGGED_FOR_REVIEW).
+  frozenRemainingMs     Int?
+  lastHeartbeatAt       DateTime?        @db.Timestamptz(3)
+  lastAnswerSavedAt     DateTime?        @db.Timestamptz(3)
+  /// 1-based position of the question the student last viewed.
+  lastQuestionPosition  Int?
+  interruptedAt         DateTime?        @db.Timestamptz(3)
+  terminatedAt          DateTime?        @db.Timestamptz(3)
+  terminationReason     String?
+  submittedAt           DateTime?        @db.Timestamptz(3)
+  /// student | timer | deadline | admin
+  submissionReason      String?
+  finalizedAt           DateTime?        @db.Timestamptz(3)
+  timeAdjustmentMinutes Int              @default(0)
+  resumeCount           Int              @default(0)
+  mcqScore              Decimal?         @db.Decimal(8, 2)
+  mcqMaxScore           Decimal?         @db.Decimal(8, 2)
+  codingScore           Decimal?         @db.Decimal(8, 2)
+  codingMaxScore        Decimal?         @db.Decimal(8, 2)
+  totalScore            Decimal?         @db.Decimal(8, 2)
+  maxScore              Decimal?         @db.Decimal(8, 2)
+  evaluationStatus      EvaluationStatus @default(NOT_EVALUATED)
+  createdAt             DateTime         @default(now()) @db.Timestamptz(3)
+  updatedAt             DateTime         @updatedAt @db.Timestamptz(3)
+
+  questions       SessionQuestion[]
+  answers         StudentAnswer[]
+  events          ProctoringEvent[]
+  reentryRequests ReentryRequest[]
+
+  /// One attempt row per number per student — also blocks duplicate creation races.
+  @@unique([studentId, attemptNumber])
+  @@index([status])
+  @@index([paperId])
+  @@index([startedAt])
+}
+
+/// The fixed, randomised question assignment for one session.
+model SessionQuestion {
+  id               String            @id @default(cuid())
+  sessionId        String
+  session          AssessmentSession @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+  /// Null once the question has been deleted from the bank; `questionSnapshot` then holds it.
+  questionId       String?
+  question         Question?         @relation(fields: [questionId], references: [id], onDelete: SetNull)
+  /// Copy of the question (type, text, difficulty, explanation, options with answer key) written
+  /// in the same transaction that deletes it from the bank, so results and reports stay complete.
+  questionSnapshot Json?
+  section          String
+  sectionTitle     String
+  /// 1-based position across the whole paper.
+  position         Int
+  /// 1-based position within its section.
+  sectionPosition  Int
+  /// QuestionOption ids in the order shown to the student (MCQ only).
+  optionOrder      String[]
+  /// Marks snapshot (paper override or question marks) taken at assignment time.
+  marks            Decimal           @db.Decimal(6, 2)
+  negativeMarks    Decimal           @db.Decimal(6, 2)
+  /// Scoring (filled at finalisation for MCQs, by a reviewer for coding).
+  isCorrect        Boolean?
+  marksAwarded     Decimal?          @db.Decimal(6, 2)
+  evaluatedById    String?
+  evaluatedBy      AdminUser?        @relation("EvaluatedBy", fields: [evaluatedById], references: [id], onDelete: SetNull)
+  evaluatedAt      DateTime?         @db.Timestamptz(3)
+  evaluatorComment String?
+
+  answer StudentAnswer?
+
+  @@unique([sessionId, position])
+  @@unique([sessionId, questionId])
+  @@index([questionId])
+}
+
+model StudentAnswer {
+  id                String            @id @default(cuid())
+  sessionQuestionId String            @unique
+  sessionQuestion   SessionQuestion   @relation(fields: [sessionQuestionId], references: [id], onDelete: Cascade)
+  sessionId         String
+  session           AssessmentSession @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+  /// Id of the chosen QuestionOption. Deliberately not a foreign key: the answer must survive the
+  /// question's deletion; the id is then resolved against SessionQuestion.questionSnapshot.
+  selectedOptionId  String?
+  answerText        String?
+  /// Monotonic client sequence; older saves can never overwrite newer ones.
+  clientSeq         BigInt
+  firstSavedAt      DateTime          @default(now()) @db.Timestamptz(3)
+  savedAt           DateTime          @default(now()) @db.Timestamptz(3)
+
+  @@index([sessionId])
+}
+
+model ProctoringEvent {
+  id             String              @id @default(cuid())
+  sessionId      String
+  session        AssessmentSession   @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+  studentId      String
+  student        Student             @relation(fields: [studentId], references: [id], onDelete: Restrict)
+  type           ProctoringEventType
+  /// Client-generated id for idempotent reporting (null for server-generated events).
+  clientEventId  String?
+  /// Time reported by the browser (informational only — never trusted for enforcement).
+  clientTime     DateTime?           @db.Timestamptz(3)
+  /// TAB_SWITCH | GENERAL | LOG_ONLY | SYSTEM
+  ruleGroup      String
+  /// Running count of counted events in this rule group (including this one).
+  eventCount     Int
+  action         EventAction
+  warningNumber  Int?
+  /// Event METADATA only (durationMs, confidence, faceCount …). Never media, frames, audio or embeddings.
+  details        Json?
+  /// When the student dismissed the on-screen warning (null = not acknowledged).
+  acknowledgedAt DateTime?           @db.Timestamptz(3)
+  createdAt      DateTime            @default(now()) @db.Timestamptz(3)
+
+  @@unique([sessionId, clientEventId])
+  @@index([sessionId, type])
+  @@index([studentId])
+  @@index([createdAt])
+}
+
+model ReentryRequest {
+  id                    String            @id @default(cuid())
+  sessionId             String
+  session               AssessmentSession @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+  studentId             String
+  student               Student           @relation(fields: [studentId], references: [id], onDelete: Restrict)
+  trigger               ReentryTrigger
+  status                ReentryStatus     @default(PENDING)
+  /// Remaining assessment time when the request was raised.
+  remainingMsAtRequest  Int
+  studentNote           String?
+  decidedById           String?
+  decidedBy             AdminUser?        @relation("ReentryDecidedBy", fields: [decidedById], references: [id], onDelete: SetNull)
+  decidedAt             DateTime?         @db.Timestamptz(3)
+  decisionReason        String?
+  timeAdjustmentMinutes Int               @default(0)
+  /// SHA-256 of the single-use resume code shown once to the approving admin.
+  resumeCodeHash        String?
+  resumeCodeExpiresAt   DateTime?         @db.Timestamptz(3)
+  resumeFailedAttempts  Int               @default(0)
+  usedAt                DateTime?         @db.Timestamptz(3)
+  createdAt             DateTime          @default(now()) @db.Timestamptz(3)
+  updatedAt             DateTime          @updatedAt @db.Timestamptz(3)
+
+  @@index([status])
+  @@index([sessionId])
+  @@index([studentId])
+}
