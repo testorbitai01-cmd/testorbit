@@ -16,7 +16,7 @@ export function Logo({ className, inverted }: { className?: string; inverted?: b
       <img
         src={inverted ? '/logo-dark.png' : '/logo.png'}
         alt="Test Orbit — Orbiting Every Exam Securely"
-        className="h-10 w-auto object-contain"
+        className="h-11 max-h-12 w-auto object-contain"
       />
     </div>
   );
