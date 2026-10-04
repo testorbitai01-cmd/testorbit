@@ -2,7 +2,7 @@ import { useState } from 'react';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { Copy, KeyRound, Search } from 'lucide-react';
 import { useOutletContext } from 'react-router-dom';
-import { EVENT_LABELS, PROCTORING_EVENT_TYPES, REENTRY_STATUSES, SESSION_STATUS_LABELS, formatDuration, type ReentryStatus, type SessionStatus } from '@test-orbit/shared';
+import { EVENT_LABELS, PROCTORING_EVENT_TYPES, REENTRY_BULK_MAX, REENTRY_STATUSES, SESSION_STATUS_LABELS, formatDuration, type ReentryStatus, type SessionStatus } from '@test-orbit/shared';
 import { Badge, SessionStatusBadge } from '@/components/ui/Badge';
 import { Button } from '@/components/ui/Button';
 import { Card, CardBody, CardHeader, DescriptionList, PageHeader } from '@/components/ui/Card';
@@ -38,7 +38,14 @@ interface Detail {
 
 const statusTone = (s: ReentryStatus) => (s === 'PENDING' ? 'warn' : s === 'APPROVED' ? 'brand' : s === 'REJECTED' ? 'danger' : s === 'USED' ? 'success' : 'neutral');
 
+/** A request that can still be approved (same rule the server enforces). */
+const decidable = (r: Row) => r.status === 'PENDING' && (r.session.status === 'INTERRUPTED' || r.session.status === 'FLAGGED_FOR_REVIEW');
+
 export function ReentryPage() {
+  const admin = useOutletContext<AdminUser>();
+  const canDecide = admin?.role === 'ADMIN';
+  const [selected, setSelected] = useState<Map<string, Row>>(new Map());
+  const [bulkOpen, setBulkOpen] = useState(false);
   const domains = useAdminDomains().data?.items ?? [];
   const [search, setSearch] = useState('');
   const [filters, setFilters] = useState({ requestStatus: 'PENDING', sessionStatus: '', domain: '', college: '', eventType: '', from: '', to: '' });
@@ -55,6 +62,46 @@ export function ReentryPage() {
   const setFilter = (k: keyof typeof filters, v: string) => {
     setFilters((f) => ({ ...f, [k]: v }));
     setPage(1);
+    setSelected(new Map());
+  };
+
+  // Selection survives paging (a whole lab can span several pages) and is cleared when filters change.
+  const pageRows = list.data?.items.filter(decidable) ?? [];
+  const allOnPage = pageRows.length > 0 && pageRows.every((r) => selected.has(r.id));
+  const toggle = (rows: Row[], on: boolean) =>
+    setSelected((prev) => {
+      const next = new Map(prev);
+      for (const r of rows) {
+        if (on) next.set(r.id, r);
+        else next.delete(r.id);
+      }
+      return next;
+    });
+  const selectColumn = {
+    key: 'select',
+    className: 'w-10',
+    header: (
+      <input
+        type="checkbox"
+        aria-label="Select all pending requests on this page"
+        checked={allOnPage}
+        disabled={pageRows.length === 0}
+        onChange={(e) => toggle(pageRows, e.target.checked)}
+        className="size-4 accent-brand-600"
+      />
+    ),
+    cell: (r: Row) =>
+      decidable(r) ? (
+        <input
+          type="checkbox"
+          aria-label={`Select ${r.student.fullName}`}
+          checked={selected.has(r.id)}
+          onChange={(e) => toggle([r], e.target.checked)}
+          onClick={(e) => e.stopPropagation()}
+          onKeyDown={(e) => e.stopPropagation()}
+          className="size-4 accent-brand-600"
+        />
+      ) : null,
   };
 
   return (
@@ -98,12 +145,28 @@ export function ReentryPage() {
           <ErrorState error={list.error} onRetry={() => void list.refetch()} />
         ) : (
           <>
+            {canDecide && selected.size > 0 && (
+              <div className="flex flex-wrap items-center justify-between gap-3 border-b border-line bg-brand-50/60 px-4 py-2.5 text-sm" role="region" aria-label="Bulk actions">
+                <span>
+                  <strong>{selected.size}</strong> pending request{selected.size === 1 ? '' : 's'} selected
+                </span>
+                <div className="flex gap-2">
+                  <Button size="sm" variant="secondary" onClick={() => setSelected(new Map())}>
+                    Clear
+                  </Button>
+                  <Button size="sm" icon={<KeyRound className="size-4" />} onClick={() => setBulkOpen(true)} disabled={selected.size > REENTRY_BULK_MAX}>
+                    Approve selected
+                  </Button>
+                </div>
+              </div>
+            )}
             <DataTable
               caption="Re-entry requests"
               rows={list.data!.items}
               rowKey={(r) => r.id}
               onRowClick={(r) => setOpenId(r.id)}
               columns={[
+                ...(canDecide ? [selectColumn] : []),
                 { key: 'student', header: 'Student', cell: (r) => <div><p className="font-medium">{r.student.fullName}</p><p className="font-mono text-xs text-ink-subtle">{r.student.mobileNumber}</p></div> },
                 { key: 'college', header: 'College / domain', cell: (r) => <div className="text-sm"><p>{r.student.collegeName}</p><p className="text-xs text-ink-subtle">{r.domainName}</p></div> },
                 { key: 'trigger', header: 'Type', cell: (r) => <Badge tone={r.trigger === 'NETWORK_INTERRUPTION' ? 'warn' : 'danger'}>{r.trigger === 'NETWORK_INTERRUPTION' ? 'Connection lost' : 'Policy termination'}</Badge> },
@@ -119,7 +182,151 @@ export function ReentryPage() {
         )}
       </Card>
       <ReentryDialog requestId={openId} onClose={() => setOpenId(null)} />
+      <BulkApproveDialog
+        open={bulkOpen}
+        rows={[...selected.values()]}
+        onClose={() => setBulkOpen(false)}
+        onApproved={(ids) => toggle(ids.map((id) => selected.get(id)!).filter(Boolean), false)}
+      />
     </>
+  );
+}
+
+interface BulkResult {
+  approved: number;
+  failed: number;
+  results: (
+    | { requestId: string; ok: true; student: { fullName: string; registrationNumber: string }; resumeCode: string; resumeCodeExpiresAt: string }
+    | { requestId: string; ok: false; error: string }
+  )[];
+}
+
+/**
+ * Approve many requests with one reason / time adjustment, then show every one-time code in a list the
+ * proctor can copy or print. Codes are shown only here (the server stores hashes), exactly like single approval.
+ */
+function BulkApproveDialog({ open, rows, onClose, onApproved }: { open: boolean; rows: Row[]; onClose: () => void; onApproved: (requestIds: string[]) => void }) {
+  const qc = useQueryClient();
+  const toast = useToast();
+  const [reason, setReason] = useState('');
+  const [adjust, setAdjust] = useState('0');
+  const [error, setError] = useState<string | null>(null);
+  const [result, setResult] = useState<BulkResult | null>(null);
+  const policy = rows.filter((r) => r.trigger === 'POLICY_TERMINATION').length;
+
+  const close = () => {
+    setReason('');
+    setAdjust('0');
+    setError(null);
+    setResult(null);
+    onClose();
+  };
+
+  const approve = useMutation({
+    mutationFn: () => api.post<BulkResult>('/admin/reentry/bulk-approve', { requestIds: rows.map((r) => r.id), reason, timeAdjustmentMinutes: Number(adjust) || 0 }),
+    onSuccess: async (r) => {
+      setResult(r);
+      onApproved(r.results.filter((x) => x.ok).map((x) => x.requestId));
+      if (r.failed === 0) toast.success(`${r.approved} re-entr${r.approved === 1 ? 'y' : 'ies'} approved`);
+      else toast.error(`${r.approved} approved, ${r.failed} not approved`, 'See the list for the reasons.');
+      await qc.invalidateQueries({ queryKey: ['admin', 'reentry'] });
+    },
+    onError: (e) => setError(e instanceof ApiError ? (Object.values(e.fieldErrors)[0] ?? e.message) : errorMessage(e)),
+  });
+
+  const codes = result?.results.filter((x) => x.ok) ?? [];
+  const failures = result?.results.filter((x) => !x.ok) ?? [];
+  const names = new Map(rows.map((r) => [r.id, r.student.fullName]));
+  const asText = () => codes.map((c) => `${c.student.registrationNumber}\t${c.student.fullName}\t${c.resumeCode}`).join('\n');
+
+  return (
+    <Dialog
+      open={open}
+      onClose={close}
+      size="lg"
+      title={result ? 'Resume codes' : `Approve ${rows.length} re-entry request${rows.length === 1 ? '' : 's'}`}
+      footer={
+        result ? (
+          <Button onClick={close}>Done</Button>
+        ) : (
+          <>
+            <Button variant="secondary" onClick={close}>
+              Cancel
+            </Button>
+            <Button onClick={() => approve.mutate()} loading={approve.isPending} disabled={reason.trim().length < 5 || rows.length === 0}>
+              Approve {rows.length}
+            </Button>
+          </>
+        )
+      }
+    >
+      {result ? (
+        <div className="space-y-4">
+          {codes.length > 0 && (
+            <>
+              <Alert tone="success" icon={<KeyRound className="size-5" />} title={`${codes.length} one-time code${codes.length === 1 ? '' : 's'} issued`}>
+                Shown only now. Each student enters their registration number and code on the session-status page; codes are valid until{' '}
+                {fmtDateTime(codes[0]!.resumeCodeExpiresAt)}.
+              </Alert>
+              <div className="max-h-80 overflow-auto rounded-lg border border-line">
+                <table className="w-full text-left text-sm">
+                  <caption className="sr-only">Issued resume codes</caption>
+                  <thead className="bg-canvas/70 text-xs uppercase tracking-wide text-ink-subtle">
+                    <tr>
+                      <th scope="col" className="px-3 py-2">Registration no.</th>
+                      <th scope="col" className="px-3 py-2">Student</th>
+                      <th scope="col" className="px-3 py-2">Resume code</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {codes.map((c) => (
+                      <tr key={c.requestId} className="border-t border-line">
+                        <td className="px-3 py-2 font-mono">{c.student.registrationNumber}</td>
+                        <td className="px-3 py-2">{c.student.fullName}</td>
+                        <td className="px-3 py-2 font-mono text-base font-bold tracking-[0.2em]">{c.resumeCode}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+              <Button size="sm" variant="secondary" icon={<Copy className="size-4" />} onClick={() => void navigator.clipboard?.writeText(asText())}>
+                Copy all (registration no., name, code)
+              </Button>
+            </>
+          )}
+          {failures.length > 0 && (
+            <Alert tone="danger" title={`${failures.length} not approved`}>
+              <ul className="mt-1 list-disc pl-5">
+                {failures.map((f) => (
+                  <li key={f.requestId}>
+                    {names.get(f.requestId) ?? f.requestId}: {f.error}
+                  </li>
+                ))}
+              </ul>
+            </Alert>
+          )}
+        </div>
+      ) : (
+        <div className="space-y-4">
+          <p className="text-sm text-ink-muted">
+            Each selected session is approved with the same reason and time adjustment, and every student receives their own one-time resume code. Rejections are
+            only possible one at a time.
+          </p>
+          {policy > 0 && (
+            <Alert tone="warn" title={`${policy} of these are policy terminations`}>
+              They were ended for exceeding proctoring warnings, not for a lost connection. Review them individually unless you are sure.
+            </Alert>
+          )}
+          <Field label="Reason" required hint="Recorded in the audit log for every approved request.">
+            {({ id, describedBy }) => <Textarea id={id} aria-describedby={describedBy} rows={3} value={reason} onChange={(e) => setReason(e.target.value)} />}
+          </Field>
+          <Field label="Time adjustment (minutes)" hint="Optional. Applied to every selected session. −60 to +60.">
+            {({ id, describedBy }) => <Input id={id} aria-describedby={describedBy} type="number" min={-60} max={60} value={adjust} onChange={(e) => setAdjust(e.target.value)} className="w-32" />}
+          </Field>
+          {error && <Alert tone="danger">{error}</Alert>}
+        </div>
+      )}
+    </Dialog>
   );
 }
 

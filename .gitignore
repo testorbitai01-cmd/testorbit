@@ -9,6 +9,8 @@ coverage/
 # Local identity-photo storage (never commit student photos)
 storage/
 uploads/
+# Database exports (admin password hashes, answer keys, student PII) — keep off Git
+backups/
 .DS_Store
 .vscode/*
 !.vscode/extensions.json

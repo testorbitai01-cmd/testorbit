@@ -18,6 +18,7 @@ export default defineConfig({
       ...rootEnv,
       NODE_ENV: 'test',
       DATABASE_URL: testDatabaseUrl ?? '',
+      DIRECT_URL: testDatabaseUrl ?? '',
       SESSION_SECRET: rootEnv.SESSION_SECRET || 'test-secret-test-secret-test-secret-1234',
       APP_ORIGIN: 'http://localhost:5173',
       PHOTO_STORAGE_DRIVER: 'local',

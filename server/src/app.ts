@@ -7,7 +7,7 @@ import { env } from './config/env.js';
 import { prisma } from './lib/prisma.js';
 import { csrfProtection } from './middleware/csrf.js';
 import { errorHandler, notFoundHandler } from './middleware/error.js';
-import { apiLimiter } from './middleware/rateLimit.js';
+import { apiLimiter, apiNetworkLimiter } from './middleware/rateLimit.js';
 import { apiRouter } from './routes.js';
 
 export function createApp(): Express {
@@ -53,8 +53,8 @@ export function createApp(): Express {
     }
   });
 
-  app.use('/api', apiLimiter);
   app.use('/api', cookieParser());
+  app.use('/api', apiNetworkLimiter, apiLimiter);
   app.use('/api', express.json({ limit: '2mb' }));
   app.use('/api', csrfProtection);
   app.use('/api', (_req, res, next) => {
@@ -71,7 +71,11 @@ export function createApp(): Express {
       express.static(env.clientDistDir, {
         index: false,
         setHeaders(res, filePath) {
+          // Vite output under /assets is content-hashed: cache forever.
           if (filePath.includes(`${path.sep}assets${path.sep}`)) res.setHeader('Cache-Control', 'public, max-age=31536000, immutable');
+          // The ~12 MB MediaPipe WASM runtime and the face model keep fixed names across releases, so
+          // they cannot be immutable; a day (a week on the CDN edge) covers every drive's launch spike.
+          else if (/[\\/](mediapipe|models)[\\/]/.test(filePath)) res.setHeader('Cache-Control', 'public, max-age=86400, s-maxage=604800');
         },
       }),
     );

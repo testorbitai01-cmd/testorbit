@@ -3,6 +3,7 @@ import supertest from 'supertest';
 import TestAgent from 'supertest/lib/agent.js';
 import { createApp } from '../src/app.js';
 import { hashPassword } from '../src/lib/password.js';
+import { clearPlatformClockCache } from '../src/lib/platformClock.js';
 import { Prisma, prisma } from '../src/lib/prisma.js';
 import { clearSettingsCache } from '../src/lib/settings.js';
 
@@ -45,6 +46,7 @@ export async function resetDb() {
   for (const d of DOMAINS) await prisma.domain.create({ data: { slug: d.slug, name: d.name } });
   await prisma.systemSetting.create({ data: { key: 'app', value: DEFAULT_SETTINGS } });
   clearSettingsCache();
+  clearPlatformClockCache();
 }
 
 export async function updateSettings(patchFn: (s: typeof DEFAULT_SETTINGS) => void) {

@@ -17,7 +17,7 @@ studentRouter.get('/domains', async (_req, res) => {
   res.json({ domains });
 });
 
-studentRouter.post('/register', registrationLimiter, async (req, res) => {
+studentRouter.post('/register', ...registrationLimiter, async (req, res) => {
   const input = registrationSchema.parse(req.body);
   const student = await registerStudent(input);
   await startStudentSession(req, res, student.id);

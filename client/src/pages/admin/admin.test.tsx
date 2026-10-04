@@ -6,6 +6,7 @@ import { DomainsPage } from '@/pages/admin/DomainsPage';
 import { PaperDetailPage } from '@/pages/admin/PaperDetailPage';
 import { PapersPage } from '@/pages/admin/PapersPage';
 import { QuestionBankPage } from '@/pages/admin/QuestionBankPage';
+import { ReentryPage } from '@/pages/admin/ReentryPage';
 import { StudentsPage } from '@/pages/admin/StudentsPage';
 import { jsonResponse, mockFetch, renderWithProviders } from '@/test/utils';
 
@@ -167,6 +168,75 @@ describe('PaperDetailPage total', () => {
 });
 
 // ───────────────────────────── Students ─────────────────────────────
+
+describe('ReentryPage bulk approval', () => {
+  const row = (id: string, fullName: string, extra: object = {}) => ({
+    id,
+    status: 'PENDING',
+    trigger: 'NETWORK_INTERRUPTION',
+    createdAt: '2026-10-04T10:00:00.000Z',
+    decidedBy: null,
+    student: { id: `st-${id}`, fullName, mobileNumber: '9876543210', collegeName: 'Orbit Institute' },
+    domainName: 'AI/ML',
+    session: { id: `se-${id}`, status: 'INTERRUPTED', lastAnswerSavedAt: null, remainingMs: 600_000, eventCount: 1 },
+    ...extra,
+  });
+  const list = {
+    items: [row('r1', 'Asha Kumar'), row('r2', 'Ravi Shah'), row('r3', 'Done Already', { status: 'USED', session: { id: 'se-r3', status: 'IN_PROGRESS', lastAnswerSavedAt: null, remainingMs: 0, eventCount: 0 } })],
+    total: 3,
+    page: 1,
+    pageSize: 20,
+  };
+  const base = {
+    'GET /api/admin/reentry': () => jsonResponse(list),
+    'GET /api/admin/students/filters': () => jsonResponse({ colleges: [], departments: [], years: [] }),
+    'GET /api/admin/domains': () => jsonResponse(DOMAINS),
+  };
+
+  it('approves the selected pending requests and lists every one-time code', async () => {
+    const posts: unknown[] = [];
+    mockFetch({
+      ...base,
+      'POST /api/admin/reentry/bulk-approve': (init) => {
+        posts.push(body(init));
+        return jsonResponse({
+          approved: 1,
+          failed: 1,
+          results: [
+            { requestId: 'r1', ok: true, student: { fullName: 'Asha Kumar', registrationNumber: 'REG001' }, resumeCode: 'K7Q2M9XA', resumeCodeExpiresAt: '2026-10-04T11:00:00.000Z' },
+            { requestId: 'r2', ok: false, error: 'This request has already been approved' },
+          ],
+        });
+      },
+    });
+    renderAdmin('/admin/reentry', '/admin/reentry', <ReentryPage />);
+
+    await userEvent.click(await screen.findByRole('checkbox', { name: 'Select all pending requests on this page' }));
+    // Only decidable rows are selectable: the used request has no checkbox.
+    expect(screen.queryByRole('checkbox', { name: 'Select Done Already' })).not.toBeInTheDocument();
+    expect(screen.getByRole('region', { name: 'Bulk actions' })).toHaveTextContent('2 pending requests selected');
+
+    await userEvent.click(screen.getByRole('button', { name: 'Approve selected' }));
+    const dialog = await screen.findByRole('dialog', { name: 'Approve 2 re-entry requests' });
+    const confirm = within(dialog).getByRole('button', { name: 'Approve 2' });
+    expect(confirm).toBeDisabled(); // a reason is required
+    await userEvent.type(within(dialog).getByLabelText(/Reason/), 'Lab 3 Wi-Fi outage');
+    await userEvent.click(confirm);
+
+    await waitFor(() => expect(posts).toEqual([{ requestIds: ['r1', 'r2'], reason: 'Lab 3 Wi-Fi outage', timeAdjustmentMinutes: 0 }]));
+    const codes = await screen.findByRole('dialog', { name: 'Resume codes' });
+    expect(within(codes).getByText('K7Q2M9XA')).toBeInTheDocument();
+    expect(within(codes).getByText('REG001')).toBeInTheDocument();
+    expect(within(codes).getByText(/Ravi Shah: This request has already been approved/)).toBeInTheDocument();
+  });
+
+  it('reviewers see no selection or bulk approval', async () => {
+    mockFetch(base);
+    renderAdmin('/admin/reentry', '/admin/reentry', <ReentryPage />, REVIEWER);
+    expect(await screen.findByText('Asha Kumar')).toBeInTheDocument();
+    expect(screen.queryByRole('checkbox')).not.toBeInTheDocument();
+  });
+});
 
 describe('StudentsPage', () => {
   const rows = { items: [{ id: 's1', fullName: 'Asha Kumar', mobileNumber: '9876543210', collegeName: 'Orbit Institute' }, { id: 's2', fullName: 'Ravi Shah', mobileNumber: '9876543211', collegeName: 'City College' }], total: 2, page: 1, pageSize: 20 };

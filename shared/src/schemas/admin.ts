@@ -61,16 +61,34 @@ export const reentryListQuerySchema = z.object({
   to: optionalDate,
 });
 
+const reentryReason = z.string().trim().min(5, { error: 'Give a reason (at least 5 characters)' }).max(1000);
+const reentryTimeAdjustment = z.coerce.number().int().min(-60, { error: 'At least -60' }).max(60, { error: 'At most 60' }).default(0);
+
+/** Most re-entry requests one bulk approval may decide (e.g. a whole lab after a network outage). */
+export const REENTRY_BULK_MAX = 200;
+
 export const reentryDecisionSchema = z
   .object({
     decision: z.enum(['APPROVE', 'REJECT']),
-    reason: z.string().trim().min(5, { error: 'Give a reason (at least 5 characters)' }).max(1000),
-    timeAdjustmentMinutes: z.coerce.number().int().min(-60, { error: 'At least -60' }).max(60, { error: 'At most 60' }).default(0),
+    reason: reentryReason,
+    timeAdjustmentMinutes: reentryTimeAdjustment,
   })
   .refine((v) => v.decision === 'APPROVE' || v.timeAdjustmentMinutes === 0, {
     path: ['timeAdjustmentMinutes'],
     error: 'Time adjustments only apply to approvals',
   });
+
+/** Approve many pending requests at once with one reason and time adjustment (approval only — never bulk reject). */
+export const reentryBulkApproveSchema = z.object({
+  requestIds: z
+    .array(z.string().min(1).max(64))
+    .min(1, { error: 'Select at least one request' })
+    .max(REENTRY_BULK_MAX, { error: `At most ${REENTRY_BULK_MAX} requests at a time` })
+    .transform((ids) => [...new Set(ids)]),
+  reason: reentryReason,
+  timeAdjustmentMinutes: reentryTimeAdjustment,
+});
+export type ReentryBulkApproveInput = z.input<typeof reentryBulkApproveSchema>;
 
 export const reportQuerySchema = z.object({
   ...pageParams,

@@ -19,7 +19,12 @@ import { describeShortfalls, eligiblePool } from './eligibility.js';
 import { applyTimeRules, finalizeSession, lockSession, pauseSession, remainingMs } from './lifecycle.js';
 import { historicalQuestion } from './questionSnapshot.js';
 
-export const HEARTBEAT_INTERVAL_SECONDS = 20;
+/**
+ * Client heartbeat period. Answer saves and proctoring events also refresh lastHeartbeatAt, and the
+ * default heartbeatTimeoutSeconds (180) still tolerates five missed beats; at 2,000 students this is
+ * ~67 heartbeats/s instead of ~100/s at 20 s.
+ */
+export const HEARTBEAT_INTERVAL_SECONDS = 30;
 const MAX_RESUME_ATTEMPTS = 5;
 
 export function sessionNotActive(status: SessionStatus) {
@@ -213,7 +218,7 @@ async function finalSummary(session: AssessmentSession) {
   };
 }
 
-function sessionInfo(s: AssessmentSession, now: Date) {
+function sessionInfo(s: SessionInfoFields, now: Date) {
   return {
     id: s.id,
     status: s.status,
@@ -370,8 +375,34 @@ export async function saveAnswer(studentId: string, sessionId: string, input: Sa
   return result;
 }
 
+type SessionInfoFields = Pick<
+  AssessmentSession,
+  'id' | 'status' | 'startedAt' | 'deadlineAt' | 'frozenRemainingMs' | 'durationMinutes' | 'lastQuestionPosition' | 'terminationReason'
+>;
+
 export async function heartbeat(studentId: string, sessionId: string, currentPosition?: number) {
   const now = new Date();
+  // Fast path (the steady-state case, ~1 request per student per interval): one conditional UPDATE,
+  // no interactive transaction. It matches only when applyTimeRules would leave the session unchanged —
+  // owned by this student, IN_PROGRESS, not past deadline + grace, heartbeat not stale. Row locks taken
+  // by a concurrent submit/terminate are waited for and the WHERE is re-checked, so it never resurrects
+  // a finished session. Anything else falls through to the locked path below.
+  const settings = await getSettings();
+  const staleCutoff = new Date(now.getTime() - settings.session.heartbeatTimeoutSeconds * 1000).toISOString();
+  const deadlineCutoff = new Date(now.getTime() - settings.session.answerGraceSeconds * 1000).toISOString();
+  const fast = await prisma.$queryRaw<SessionInfoFields[]>`
+    UPDATE "AssessmentSession"
+       SET "lastHeartbeatAt" = ${now.toISOString()}::timestamptz,
+           "lastQuestionPosition" = COALESCE(${currentPosition ?? null}::int, "lastQuestionPosition"),
+           "updatedAt" = ${now.toISOString()}::timestamptz
+     WHERE id = ${sessionId}
+       AND "studentId" = ${studentId}
+       AND status = 'IN_PROGRESS'
+       AND "deadlineAt" >= ${deadlineCutoff}::timestamptz
+       AND COALESCE("lastHeartbeatAt", "startedAt", "createdAt") >= ${staleCutoff}::timestamptz
+    RETURNING id, status, "startedAt", "deadlineAt", "frozenRemainingMs", "durationMinutes", "lastQuestionPosition", "terminationReason"`;
+  if (fast[0]) return { serverNow: now.toISOString(), session: sessionInfo(fast[0], now) };
+
   const session = await prisma.$transaction(async (tx) => {
     const s = await lockOwnSession(tx, studentId, sessionId, now);
     if (s.status !== 'IN_PROGRESS') return s;

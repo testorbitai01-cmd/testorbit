@@ -7,6 +7,7 @@
 import type { AssessmentSession, ReentryTrigger } from '@prisma/client';
 import { type SessionStatus, type Settings } from '@test-orbit/shared';
 import { conflict, notFound } from '../../lib/errors.js';
+import { getPlatformClock, heartbeatFloor } from '../../lib/platformClock.js';
 import { Prisma, num, num0, type Tx } from '../../lib/prisma.js';
 import { fromSnapshot, historicalQuestion } from './questionSnapshot.js';
 import { computeTotals, isBlankAnswer, scoreMcq } from './scoring.js';
@@ -35,6 +36,17 @@ export function assertTransition(from: SessionStatus, to: SessionStatus): void {
 export async function lockSession(tx: Tx, sessionId: string): Promise<AssessmentSession> {
   const rows = await tx.$queryRaw<{ id: string }[]>`SELECT id FROM "AssessmentSession" WHERE id = ${sessionId} FOR UPDATE`;
   if (rows.length === 0) throw notFound('Assessment session not found');
+  return tx.assessmentSession.findUniqueOrThrow({ where: { id: sessionId } });
+}
+
+/**
+ * Like lockSession, but returns null instead of waiting when another transaction (a student
+ * request, an admin action, or the sweeper on another replica) already holds the row.
+ * Background jobs use it so they never queue behind live traffic; they retry on the next tick.
+ */
+export async function tryLockSession(tx: Tx, sessionId: string): Promise<AssessmentSession | null> {
+  const rows = await tx.$queryRaw<{ id: string }[]>`SELECT id FROM "AssessmentSession" WHERE id = ${sessionId} FOR UPDATE SKIP LOCKED`;
+  if (rows.length === 0) return null;
   return tx.assessmentSession.findUniqueOrThrow({ where: { id: sessionId } });
 }
 
@@ -67,6 +79,7 @@ export async function finalizeSession(
   });
 
   const totalsInput = [];
+  const rows: Prisma.Sql[] = [];
   for (const sq of questions) {
     const q = historicalQuestion(sq.question, sq.questionSnapshot);
     const type = q.type;
@@ -89,16 +102,23 @@ export async function finalizeSession(
       comment = 'No answer submitted';
       evaluatedAt = opts.now;
     }
-    await tx.sessionQuestion.update({
-      where: { id: sq.id },
-      data: {
-        isCorrect,
-        marksAwarded: marksAwarded === null ? null : new Prisma.Decimal(marksAwarded),
-        evaluatedAt,
-        evaluatorComment: comment,
-      },
-    });
+    rows.push(
+      Prisma.sql`(${sq.id}, ${isCorrect}::boolean, ${marksAwarded === null ? null : marksAwarded.toFixed(2)}::numeric, ${evaluatedAt?.toISOString() ?? null}::timestamptz, ${comment}::text)`,
+    );
     totalsInput.push({ type, marks: num0(sq.marks), marksAwarded });
+  }
+
+  // One statement for the whole paper instead of one UPDATE per question: at the end of a drive
+  // thousands of sessions finalise within seconds, and each round trip holds the session row lock.
+  if (rows.length > 0) {
+    await tx.$executeRaw`
+      UPDATE "SessionQuestion" AS sq
+         SET "isCorrect" = v.is_correct,
+             "marksAwarded" = v.marks_awarded,
+             "evaluatedAt" = v.evaluated_at,
+             "evaluatorComment" = v.comment
+        FROM (VALUES ${Prisma.join(rows)}) AS v(id, is_correct, marks_awarded, evaluated_at, comment)
+       WHERE sq.id = v.id AND sq."sessionId" = ${session.id}`;
   }
 
   const t = computeTotals(totalsInput);
@@ -204,7 +224,8 @@ export async function pauseSession(
 
 /**
  * Apply server-clock rules to an IN_PROGRESS session:
- *   • no heartbeat for `heartbeatTimeoutSeconds` (before the deadline) ⇒ INTERRUPTED
+ *   • no heartbeat for `heartbeatTimeoutSeconds` (before the deadline) ⇒ INTERRUPTED — silence is only
+ *     counted from the end of the last platform outage (lib/platformClock.ts), never during one
  *   • deadline (+ grace) passed ⇒ EXPIRED (auto-submitted and scored)
  * Must be called with the session row locked.
  */
@@ -212,7 +233,9 @@ export async function applyTimeRules(tx: Tx, session: AssessmentSession, setting
   if (session.status !== 'IN_PROGRESS' || !session.deadlineAt) return session;
   const deadline = session.deadlineAt.getTime();
   const lastSeen = (session.lastHeartbeatAt ?? session.startedAt ?? session.createdAt).getTime();
-  const staleAt = lastSeen + settings.session.heartbeatTimeoutSeconds * 1000;
+  const floor = heartbeatFloor(await getPlatformClock(tx), now);
+  const silentSince = Math.max(lastSeen, floor?.getTime() ?? 0);
+  const staleAt = silentSince + settings.session.heartbeatTimeoutSeconds * 1000;
 
   if (now.getTime() > staleAt && staleAt < deadline) {
     return pauseSession(tx, session, 'INTERRUPTED', {

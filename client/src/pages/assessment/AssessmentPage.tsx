@@ -189,9 +189,21 @@ function ExamRoom({ view }: { view: AssessmentView }) {
         if (e instanceof ApiError && (e.status === 401 || e.status === 404)) void leave();
       }
     };
+    // Chained (never overlapping when the server is slow) with ±15 % jitter per beat, so a whole lab
+    // that (re)connected at the same moment drifts apart instead of beating in lock-step.
+    const base = (view.heartbeatIntervalSeconds ?? 30) * 1000;
+    let stopped = false;
+    let t: ReturnType<typeof setTimeout> | undefined;
+    const schedule = () => {
+      if (stopped) return;
+      t = setTimeout(() => void beat().finally(schedule), base * (0.85 + Math.random() * 0.3));
+    };
     void beat();
-    const t = setInterval(beat, (view.heartbeatIntervalSeconds ?? 20) * 1000);
-    return () => clearInterval(t);
+    schedule();
+    return () => {
+      stopped = true;
+      clearTimeout(t);
+    };
   }, [sessionId, sync, leave, view.heartbeatIntervalSeconds]);
 
   useEffect(() => {

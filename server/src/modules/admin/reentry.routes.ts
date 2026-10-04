@@ -1,9 +1,9 @@
-import { Router } from 'express';
-import { SESSION_STATUS_LABELS, reentryDecisionSchema, reentryListQuerySchema } from '@test-orbit/shared';
+import { Router, type Request } from 'express';
+import { SESSION_STATUS_LABELS, reentryBulkApproveSchema, reentryDecisionSchema, reentryListQuerySchema } from '@test-orbit/shared';
 import { z } from 'zod';
 import { audit } from '../../lib/audit.js';
 import { generateResumeCode, hashToken } from '../../lib/crypto.js';
-import { conflict, notFound, unprocessable } from '../../lib/errors.js';
+import { AppError, conflict, notFound, unprocessable } from '../../lib/errors.js';
 import { Prisma, prisma, type Tx } from '../../lib/prisma.js';
 import { getSettings } from '../../lib/settings.js';
 import { requireRole } from '../../middleware/auth.js';
@@ -119,52 +119,101 @@ async function issueCode(tx: Tx, requestId: string) {
   return { code, expiresAt };
 }
 
+/** Lock the request's session and check the request can still be decided. */
+async function lockPendingRequest(tx: Tx, requestId: string) {
+  const pre = await tx.reentryRequest.findUnique({ where: { id: requestId } });
+  if (!pre) throw notFound('Re-entry request not found');
+  const session = await lockSession(tx, pre.sessionId);
+  const request = await tx.reentryRequest.findUniqueOrThrow({ where: { id: requestId } });
+
+  if (request.status !== 'PENDING') throw conflict(`This request has already been ${request.status.toLowerCase()}`, undefined, 'ALREADY_DECIDED');
+  if (session.status !== 'INTERRUPTED' && session.status !== 'FLAGGED_FOR_REVIEW') {
+    // Guards against accidentally "resuming" a submitted/expired/terminated assessment.
+    throw conflict(`This assessment is ${SESSION_STATUS_LABELS[session.status].toLowerCase()} and cannot be resumed`, undefined, 'SESSION_NOT_REVIEWABLE');
+  }
+  return { request, session };
+}
+
+/** Approve a locked, pending request: record the decision, issue a one-time code, audit (without the code). */
+async function approveLocked(
+  tx: Tx,
+  req: Request,
+  { request, session }: Awaited<ReturnType<typeof lockPendingRequest>>,
+  input: { reason: string; timeAdjustmentMinutes: number },
+  now: Date,
+  auditExtra: Record<string, Prisma.InputJsonValue> = {},
+) {
+  const remaining = (session.frozenRemainingMs ?? 0) + input.timeAdjustmentMinutes * 60_000;
+  if (remaining < MIN_RESUME_MS) {
+    throw unprocessable('The student would have no time left. Add a positive time adjustment to approve.', {
+      fieldErrors: { timeAdjustmentMinutes: 'Not enough remaining time' },
+    });
+  }
+  await tx.reentryRequest.update({
+    where: { id: request.id },
+    data: {
+      status: 'APPROVED',
+      decidedById: req.admin!.id,
+      decidedAt: now,
+      decisionReason: input.reason,
+      timeAdjustmentMinutes: input.timeAdjustmentMinutes,
+    },
+  });
+  const { code, expiresAt } = await issueCode(tx, request.id);
+  await audit(
+    req,
+    {
+      action: 'REENTRY_APPROVED',
+      entityType: 'ReentryRequest',
+      entityId: request.id,
+      details: { sessionId: session.id, reason: input.reason, timeAdjustmentMinutes: input.timeAdjustmentMinutes, resumeRemainingMs: remaining, ...auditExtra },
+    },
+    tx,
+  );
+  return { resumeCode: code, resumeCodeExpiresAt: expiresAt };
+}
+
+/**
+ * Approve many requests at once (e.g. a whole lab after a network outage). Each request is decided in
+ * its own transaction with exactly the single-approval rules, so one ineligible request never blocks
+ * the rest; the response lists every outcome. Codes are returned once, here, for the proctor to hand out.
+ */
+const BULK_CONCURRENCY = 5;
+reentryRouter.post('/bulk-approve', requireRole('ADMIN'), async (req, res) => {
+  const input = reentryBulkApproveSchema.parse(req.body);
+  const now = new Date();
+  const approveOne = async (requestId: string) => {
+    try {
+      return await prisma.$transaction(async (tx) => {
+        const locked = await lockPendingRequest(tx, requestId);
+        const student = await tx.student.findUniqueOrThrow({ where: { id: locked.request.studentId }, select: { fullName: true, registrationNumber: true } });
+        const issued = await approveLocked(tx, req, locked, input, now, { bulk: true, bulkSize: input.requestIds.length });
+        return { requestId, ok: true as const, student, ...issued };
+      });
+    } catch (e) {
+      if (!(e instanceof AppError)) console.error(`[reentry] bulk approval of ${requestId} failed:`, (e as Error).message);
+      return { requestId, ok: false as const, error: e instanceof AppError ? e.message : 'Unexpected error — try this request individually' };
+    }
+  };
+  const results = [];
+  for (let i = 0; i < input.requestIds.length; i += BULK_CONCURRENCY) {
+    results.push(...(await Promise.all(input.requestIds.slice(i, i + BULK_CONCURRENCY).map(approveOne))));
+  }
+  const approved = results.filter((r) => r.ok).length;
+  res.json({ approved, failed: results.length - approved, results });
+});
+
 reentryRouter.post('/:requestId/decision', requireRole('ADMIN'), async (req, res) => {
   const { requestId } = idParam.parse(req.params);
   const input = reentryDecisionSchema.parse(req.body);
   const now = new Date();
 
   const result = await prisma.$transaction(async (tx) => {
-    const pre = await tx.reentryRequest.findUnique({ where: { id: requestId } });
-    if (!pre) throw notFound('Re-entry request not found');
-    const session = await lockSession(tx, pre.sessionId);
-    const request = await tx.reentryRequest.findUniqueOrThrow({ where: { id: requestId } });
-
-    if (request.status !== 'PENDING') throw conflict(`This request has already been ${request.status.toLowerCase()}`, undefined, 'ALREADY_DECIDED');
-    if (session.status !== 'INTERRUPTED' && session.status !== 'FLAGGED_FOR_REVIEW') {
-      // Guards against accidentally "resuming" a submitted/expired/terminated assessment.
-      throw conflict(`This assessment is ${SESSION_STATUS_LABELS[session.status].toLowerCase()} and cannot be resumed`, undefined, 'SESSION_NOT_REVIEWABLE');
-    }
+    const locked = await lockPendingRequest(tx, requestId);
+    const { session } = locked;
 
     if (input.decision === 'APPROVE') {
-      const remaining = (session.frozenRemainingMs ?? 0) + input.timeAdjustmentMinutes * 60_000;
-      if (remaining < MIN_RESUME_MS) {
-        throw unprocessable('The student would have no time left. Add a positive time adjustment to approve.', {
-          fieldErrors: { timeAdjustmentMinutes: 'Not enough remaining time' },
-        });
-      }
-      await tx.reentryRequest.update({
-        where: { id: requestId },
-        data: {
-          status: 'APPROVED',
-          decidedById: req.admin!.id,
-          decidedAt: now,
-          decisionReason: input.reason,
-          timeAdjustmentMinutes: input.timeAdjustmentMinutes,
-        },
-      });
-      const { code, expiresAt } = await issueCode(tx, requestId);
-      await audit(
-        req,
-        {
-          action: 'REENTRY_APPROVED',
-          entityType: 'ReentryRequest',
-          entityId: requestId,
-          details: { sessionId: session.id, reason: input.reason, timeAdjustmentMinutes: input.timeAdjustmentMinutes, resumeRemainingMs: remaining },
-        },
-        tx,
-      );
-      return { decision: 'APPROVED' as const, resumeCode: code, resumeCodeExpiresAt: expiresAt };
+      return { decision: 'APPROVED' as const, ...(await approveLocked(tx, req, locked, input, now)) };
     }
 
     await tx.reentryRequest.update({

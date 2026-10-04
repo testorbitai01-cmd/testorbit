@@ -11,5 +11,7 @@ export default function setup() {
   if (url === (process.env.DATABASE_URL ?? env.DATABASE_URL)) {
     throw new Error('TEST_DATABASE_URL must differ from DATABASE_URL — tests wipe this database.');
   }
-  execSync('npx prisma migrate deploy', { cwd: root, env: { ...process.env, DATABASE_URL: url }, stdio: 'pipe' });
+  // `prisma migrate` connects through DIRECT_URL (schema.prisma `directUrl`), so it must point at the
+  // test database too — otherwise the value from .env would run the migrations against production.
+  execSync('npx prisma migrate deploy', { cwd: root, env: { ...process.env, DATABASE_URL: url, DIRECT_URL: url }, stdio: 'pipe' });
 }

@@ -3,6 +3,30 @@ import { InsufficientPoolError, buildAssignments, type PaperConfig, type PoolQue
 import { canTransition } from '../src/modules/assessment/lifecycle.js';
 import { computeTotals, scoreMcq } from '../src/modules/assessment/scoring.js';
 import { secureShuffle } from '../src/lib/crypto.js';
+import { OUTAGE_GAP_MS, heartbeatFloor } from '../src/lib/platformClock.js';
+
+describe('heartbeatFloor (platform outage guard)', () => {
+  const now = new Date('2026-10-04T10:00:00.000Z');
+  const ago = (ms: number) => new Date(now.getTime() - ms);
+
+  it('applies no floor before the platform clock exists (old behaviour)', () => {
+    expect(heartbeatFloor(null, now)).toBeNull();
+  });
+
+  it('applies no floor while the platform is healthy and never had an outage', () => {
+    expect(heartbeatFloor({ aliveAt: ago(10_000), resumedAt: null }, now)).toBeNull();
+  });
+
+  it('counts silence only from the end of the last outage', () => {
+    const resumedAt = ago(30_000);
+    expect(heartbeatFloor({ aliveAt: ago(5_000), resumedAt }, now)).toEqual(resumedAt);
+  });
+
+  it('suspends staleness entirely while the clock itself is stale (outage in progress / just restarted)', () => {
+    expect(heartbeatFloor({ aliveAt: ago(OUTAGE_GAP_MS + 1), resumedAt: null }, now)).toEqual(now);
+    expect(heartbeatFloor({ aliveAt: ago(OUTAGE_GAP_MS), resumedAt: null }, now)).toBeNull();
+  });
+});
 
 const pool = (prefix: string, n: number, type: 'MCQ' | 'CODING' = 'MCQ'): PoolQuestion[] =>
   Array.from({ length: n }, (_, i) => ({

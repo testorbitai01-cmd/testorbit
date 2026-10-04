@@ -23,6 +23,7 @@ Do not set `NPM_CONFIG_PRODUCTION=true` / `--omit=dev` for the build: the client
 | --- | --- |
 | `NODE_ENV` | `production` |
 | `DATABASE_URL` | `${{Postgres.DATABASE_URL}}` (private network; no SSL parameters needed). If you ever use the public proxy URL instead, append `?sslmode=require`. |
+| `DIRECT_URL` | **Required** (`prisma/schema.prisma` `directUrl`, used by `prisma migrate deploy`). Railway Postgres: same as `DATABASE_URL`. Supabase: the session pooler on port 5432 — see the README §5. |
 | `SESSION_SECRET` | 48+ random bytes, e.g. `node -e "console.log(require('crypto').randomBytes(48).toString('base64url'))"` |
 | `TRUST_PROXY` | `1` (correct client IPs for rate limiting/audit behind Railway's proxy) |
 | `APP_ORIGIN` | optional — defaults to `https://${RAILWAY_PUBLIC_DOMAIN}`; set it if you use a custom domain |
