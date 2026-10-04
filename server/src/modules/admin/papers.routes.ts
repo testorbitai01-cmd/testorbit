@@ -22,46 +22,55 @@ papersRouter.get('/:id', async (req, res) => {
 
 papersRouter.post('/', async (req, res) => {
   const data = paperInputSchema.parse(req.body);
-  const paper = await prisma.$transaction(async (tx) => {
-    const p = await createPaper(data, req.admin!.id, tx);
-    await audit(req, { action: 'PAPER_CREATED', entityType: 'QuestionPaper', entityId: p.id, details: { name: p.name, domain: data.domainSlug } }, tx);
-    return p;
-  });
+  const paper = await prisma.$transaction(
+    async (tx) => {
+      const p = await createPaper(data, req.admin!.id, tx);
+      await audit(req, { action: 'PAPER_CREATED', entityType: 'QuestionPaper', entityId: p.id, details: { name: p.name, domain: data.domainSlug } }, tx);
+      return p;
+    },
+    { timeout: 30_000, maxWait: 10_000 },
+  );
   res.status(201).json(await serializePaper(paper));
 });
 
 papersRouter.put('/:id', async (req, res) => {
   const { id } = idParam.parse(req.params);
   const data = paperInputSchema.parse(req.body);
-  const paper = await prisma.$transaction(async (tx) => {
-    const p = await updatePaper(id, data, tx);
-    await audit(
-      req,
-      {
-        action: 'PAPER_UPDATED',
-        entityType: 'QuestionPaper',
-        entityId: id,
-        details: { name: data.name, durationMinutes: data.durationMinutes, sections: data.sections.map((s) => `${s.key}:${s.questionCount}`).join(',') },
-      },
-      tx,
-    );
-    return p;
-  });
+  const paper = await prisma.$transaction(
+    async (tx) => {
+      const p = await updatePaper(id, data, tx);
+      await audit(
+        req,
+        {
+          action: 'PAPER_UPDATED',
+          entityType: 'QuestionPaper',
+          entityId: id,
+          details: { name: data.name, durationMinutes: data.durationMinutes, sections: data.sections.map((s) => `${s.key}:${s.questionCount}`).join(',') },
+        },
+        tx,
+      );
+      return p;
+    },
+    { timeout: 30_000, maxWait: 10_000 },
+  );
   res.json(await serializePaper(paper));
 });
 
 papersRouter.patch('/:id/active', async (req, res) => {
   const { id } = idParam.parse(req.params);
   const { isActive } = z.object({ isActive: z.boolean() }).parse(req.body);
-  const { paper, deactivated } = await prisma.$transaction(async (tx) => {
-    const r = await setPaperActive(id, isActive, tx);
-    await audit(
-      req,
-      { action: isActive ? 'PAPER_ACTIVATED' : 'PAPER_DEACTIVATED', entityType: 'QuestionPaper', entityId: id, details: { deactivatedPapers: r.deactivated.map((d) => d.id) } },
-      tx,
-    );
-    return r;
-  });
+  const { paper, deactivated } = await prisma.$transaction(
+    async (tx) => {
+      const r = await setPaperActive(id, isActive, tx);
+      await audit(
+        req,
+        { action: isActive ? 'PAPER_ACTIVATED' : 'PAPER_DEACTIVATED', entityType: 'QuestionPaper', entityId: id, details: { deactivatedPapers: r.deactivated.map((d) => d.id) } },
+        tx,
+      );
+      return r;
+    },
+    { timeout: 30_000, maxWait: 10_000 },
+  );
   res.json({ paper: await serializePaper(paper), deactivated });
 });
 
