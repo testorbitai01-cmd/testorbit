@@ -26,7 +26,8 @@
     "railway:release": "prisma migrate deploy && prisma db seed && npm run admin:bootstrap",
     "db:export": "tsx scripts/export-data.ts",
     "db:import": "tsx scripts/import-data.ts",
-    "db:verify": "tsx --env-file=.env scripts/verify-supabase.ts"
+    "db:verify": "tsx --env-file=.env scripts/verify-supabase.ts",
+    "benchmark:capacity": "tsx --env-file=.env scripts/benchmark-capacity.ts"
   },
   "prisma": {
     "schema": "prisma/schema.prisma",
