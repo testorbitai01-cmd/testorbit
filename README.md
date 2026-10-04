@@ -64,11 +64,10 @@ Row-lock contention is *not* a global bottleneck: every lock is on one student's
                                                      │ cache misses + all /api
                                                      ▼
                  ┌──────────────────────────────────────────────────────────────────────┐
-                 │ RAILWAY web service (region = same as database)                       │
+                 │ RAILWAY web service × 2 replicas (region = same as database)          │
                  │ Express 5: helmet/CSP · cookie session · CSRF · rate limits · Zod     │
-                 │ In-process jobs: session sweeper (SKIP LOCKED) · purges               │
-                 │ Photo storage driver (local volume today → object storage for >1      │
-                 │ replica, see §3.3)                                                    │
+                 │ In-process jobs: platform clock · sweeper (SKIP LOCKED) · purges      │
+                 │ Identity photos → private Supabase Storage bucket (§3.3)              │
                  └───────────────────────────────────┬──────────────────────────────────┘
                                  Prisma, pool capped by connection_limit per replica
                                                      ▼
@@ -115,16 +114,25 @@ Prisma's default pool size is `2 × CPU cores + 1`, and inside a container Node 
 
 Rule: **replicas × `connection_limit` ≤ the pooler's *Pool Size*** (Supabase → Database → Settings → Connection pooling). Raising Supabase compute raises both the pool size and `max_connections`. With the database in-region, 20 connections per replica sustain several hundred locked transactions per second.
 
-### 3.3 One replica with a volume, or object storage — not both
+### 3.3 Photos in Supabase Storage → run 2 replicas
 
-Identity photos use the `local` storage driver ([`server/src/lib/storage.ts`](server/src/lib/storage.ts)), which writes to a Railway Volume. **A Railway volume attaches to a single instance, so a service with a volume cannot run multiple replicas.** Pick one:
+A Railway volume attaches to a single instance, so the `local` photo driver limits the API to **one replica** (one crash = every student briefly disconnected). Use the **`supabase` driver** ([`server/src/lib/storage.ts`](server/src/lib/storage.ts)) instead; then nothing in the API is tied to one instance:
 
-| Option | When |
+| Concern | Replica-safe because |
 | :--- | :--- |
-| **1 replica + volume** (current code) | Sufficient for 2,000 students *once the CDN serves static files and the DB is in-region* — the API itself is ~250 req/s of short queries. Give the service ≥ 2 vCPU / 2 GB during the drive. Single point of failure: see [§10](#10-known-risks--roadmap). |
-| **2–3 replicas + object storage** (recommended next step) | Add a `PhotoStorage` driver for Supabase Storage (S3-compatible API) and remove the volume. Everything else is already replica-safe: sessions are in PostgreSQL, the sweeper claims rows with `SKIP LOCKED`, rate limits degrade gracefully per replica. |
+| Sessions, answers, timers | All in PostgreSQL |
+| Identity photos | Private Supabase Storage bucket, shared by all replicas |
+| Background sweeper | Rows claimed with `SKIP LOCKED`; every replica may run it |
+| Outage detection | Platform clock in PostgreSQL, stamped by every replica |
+| Rate limits | In-memory per replica — limits become N× looser, acceptable for abuse ceilings |
 
-`PHOTO_STORAGE_DRIVER=disabled` is also a valid exam-day fallback (the capture step still verifies the camera; nothing is stored).
+Setup:
+1. Supabase → **Storage → New bucket** `identity-photos`, **Public bucket: OFF**. No policies are needed (the service-role key is used server-side only).
+2. Railway variables: `PHOTO_STORAGE_DRIVER=supabase`, `SUPABASE_URL=https://<project-ref>.supabase.co`, `SUPABASE_SERVICE_ROLE_KEY=<service_role key>` (Project Settings → API). The app refuses to start if either is missing.
+3. Remove the Railway volume, then set **replicas = 2** (3 adds little: the API is not CPU-bound once the CDN serves static files).
+4. Keep replicas × `connection_limit` ≤ the pooler pool size ([§3.2](#32-size-the-prisma-pool-against-the-supabase-pooler)), e.g. 2 × 20.
+
+Photos captured under the `local` driver are not migrated (the database is still master-data only, so there are none). `PHOTO_STORAGE_DRIVER=disabled` remains an exam-day fallback (the capture step still verifies the camera; nothing is stored).
 
 ### 3.4 Cloudflare in front of Railway
 
@@ -184,7 +192,8 @@ Copy [`.env.example`](.env.example) to `.env`. Every variable is validated at st
 | `SESSION_SECRET` | ≥ 32 random chars | ≥ 48 random bytes; never reuse the local value |
 | `TRUST_PROXY` | `0` | `1` (Railway only) · `2` (Cloudflare → Railway) |
 | `APP_ORIGIN` | `http://localhost:5173` | `https://<custom-domain>` |
-| `PHOTO_STORAGE_DRIVER` / `PHOTO_STORAGE_DIR` | `local` / `./storage/identity-photos` | `local` / `/data/identity-photos` (volume) or `disabled` |
+| `PHOTO_STORAGE_DRIVER` | `local` (+ `PHOTO_STORAGE_DIR=./storage/identity-photos`) | `supabase` (recommended, allows replicas) · `local` with a volume (1 replica) · `disabled` |
+| `SUPABASE_URL` / `SUPABASE_SERVICE_ROLE_KEY` / `SUPABASE_STORAGE_BUCKET` | — | required for `supabase` photos; bucket defaults to `identity-photos` (private). **Server-side secret.** |
 | `ADMIN_BOOTSTRAP_EMAIL` / `ADMIN_BOOTSTRAP_PASSWORD` | first run only | first deploy only — delete afterwards |
 
 Supabase connection string shapes (take the real values from *Project → Connect*; URL-encode special characters in the password, e.g. `@` → `%40`):
@@ -270,7 +279,7 @@ Production backups: Supabase daily backups (Pro plan; enable PITR for drive days
 
 ### T − 48 h
 - [ ] Supabase compute: scale to **Small** or **Medium** (more CPU, larger pool). Re-check that replicas × `connection_limit` ≤ pool size.
-- [ ] Railway: service in the **same region** as Supabase; ≥ 2 vCPU / 2 GB. Replicas: 1 while photos use the volume ([§3.3](#33-one-replica-with-a-volume-or-object-storage--not-both)).
+- [ ] Railway: service in the **same region** as Supabase; ≥ 2 vCPU / 2 GB per replica; **2 replicas** with `PHOTO_STORAGE_DRIVER=supabase` ([§3.3](#33-photos-in-supabase-storage--run-2-replicas)).
 - [ ] Variables set: `DATABASE_URL` (with `connection_limit`), `DIRECT_URL`, `TRUST_PROXY`, `APP_ORIGIN`.
 - [ ] Data API locked down ([§3.5](#35-lock-down-supabases-data-api)).
 - [ ] Admin → **Question Papers**: every active paper shows *Ready* (enough eligible questions per section).
@@ -297,7 +306,7 @@ Production backups: Supabase daily backups (Pro plan; enable PITR for drive days
 | :--- | :--- | :--- | :--- |
 | ~~P0~~ | ~~Platform outage → mass `INTERRUPTED`~~ | — | **Fixed:** platform outage guard + bulk re-entry approval ([§4](#4-what-has-been-optimised-and-where) #10, #11). |
 | **P1** | **Campus network outage** (our platform healthy, the college's internet down > 180 s). | Affected students are `INTERRUPTED` — by design, their time is frozen. | Admin → Re-entry → filter by college → select all → *Approve selected*; hand out the printed code list. |
-| **P1** | Single replica while photos use a Railway volume. | A crash restarts the only instance (≈ 30–60 s); within the 180 s timeout students just see a reconnect. | Supabase Storage `PhotoStorage` driver → 2 replicas. |
+| ~~P1~~ | ~~Single replica while photos use a Railway volume~~ | — | **Fixed:** `supabase` photo driver ([§3.3](#33-photos-in-supabase-storage--run-2-replicas)) → run 2 replicas. |
 | **P1** | Database region (currently Tokyo). | Latency-bound throughput ([§3.1](#31-put-the-api-and-the-database-in-the-same-region)). | Recreate in Singapore/Mumbai while the database is still master-data only. |
 | **P2** | Requests that bypass Cloudflare (the `*.up.railway.app` domain) can spoof `X-Forwarded-For` when `TRUST_PROXY=2`. | IP-keyed limits can be evaded by an attacker who knows the Railway hostname. | Remove the Railway-generated public domain once the custom domain works. |
 | **P2** | `saveAnswer` still takes ~8 statements under a row lock. | Fine in-region (~10 ms); first thing to optimise if load tests show pool waits. | Single-statement CTE upsert with the same guards as the heartbeat fast path. |

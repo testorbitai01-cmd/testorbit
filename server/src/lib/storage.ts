@@ -4,6 +4,8 @@
  * Drivers
  *  • local    — files under PHOTO_STORAGE_DIR. In production this directory MUST be a
  *               persistent mount (a Railway Volume), because container disks are ephemeral.
+ *               A volume attaches to one instance, so this driver limits the API to one replica.
+ *  • supabase — a private Supabase Storage bucket (shared by all replicas).
  *  • disabled — photos are never stored; the capture step only verifies the camera works.
  *
  * Photos are never publicly served. They are streamed only through the admin-only,
@@ -60,6 +62,77 @@ class LocalPhotoStorage implements PhotoStorage {
   }
 }
 
+const MIME_BY_EXT: Record<string, string> = { jpg: 'image/jpeg', png: 'image/png', webp: 'image/webp' };
+const STORAGE_TIMEOUT_MS = 15_000;
+
+/**
+ * Supabase Storage (S3-backed object storage) via its REST API, authenticated with the service-role key.
+ * Shared by every replica, so — unlike a Railway volume — it allows running the API with several replicas.
+ * The bucket must be PRIVATE: photos are only ever streamed through the admin-only endpoint.
+ */
+export class SupabasePhotoStorage implements PhotoStorage {
+  readonly driver = 'supabase';
+  readonly enabled = true;
+  private readonly base: string;
+
+  constructor(
+    url: string,
+    private readonly serviceKey: string,
+    private readonly bucket: string,
+    private readonly fetchImpl: typeof fetch = fetch,
+  ) {
+    this.base = `${url.replace(/\/+$/, '')}/storage/v1/object`;
+  }
+
+  private objectUrl(key: string, prefix = ''): string {
+    if (!SAFE_KEY.test(key)) throw new Error('Invalid storage key');
+    return `${this.base}/${prefix}${encodeURIComponent(this.bucket)}/${key.split('/').map(encodeURIComponent).join('/')}`;
+  }
+
+  private async call(url: string, init: RequestInit): Promise<Response> {
+    return this.fetchImpl(url, {
+      ...init,
+      headers: { Authorization: `Bearer ${this.serviceKey}`, apikey: this.serviceKey, ...init.headers },
+      signal: AbortSignal.timeout(STORAGE_TIMEOUT_MS),
+    });
+  }
+
+  /** Storage reports a missing object as 404, or as 400 with statusCode "404" in the JSON body. */
+  private static async isNotFound(res: Response): Promise<boolean> {
+    if (res.status === 404) return true;
+    if (res.status !== 400) return false;
+    const body = (await res.json().catch(() => null)) as { statusCode?: string | number; error?: string } | null;
+    return String(body?.statusCode) === '404' || /not.?found/i.test(String(body?.error ?? ''));
+  }
+
+  private static async fail(op: string, res: Response): Promise<never> {
+    // Status only: the body can echo request details and the key must never be logged.
+    throw new Error(`Supabase Storage ${op} failed (HTTP ${res.status})`);
+  }
+
+  async put(key: string, data: Buffer): Promise<void> {
+    const res = await this.call(this.objectUrl(key), {
+      method: 'POST',
+      headers: { 'Content-Type': MIME_BY_EXT[key.split('.').pop()!.toLowerCase()] ?? 'application/octet-stream', 'x-upsert': 'true', 'Cache-Control': 'no-store' },
+      body: new Uint8Array(data),
+    });
+    if (!res.ok) await SupabasePhotoStorage.fail('upload', res);
+  }
+
+  async get(key: string): Promise<Buffer | null> {
+    const res = await this.call(this.objectUrl(key, 'authenticated/'), { method: 'GET' });
+    if (res.ok) return Buffer.from(await res.arrayBuffer());
+    if (await SupabasePhotoStorage.isNotFound(res)) return null;
+    return SupabasePhotoStorage.fail('download', res);
+  }
+
+  async delete(key: string): Promise<void> {
+    const res = await this.call(this.objectUrl(key), { method: 'DELETE' });
+    if (res.ok || (await SupabasePhotoStorage.isNotFound(res))) return;
+    await SupabasePhotoStorage.fail('delete', res);
+  }
+}
+
 class DisabledPhotoStorage implements PhotoStorage {
   readonly driver = 'disabled';
   readonly enabled = false;
@@ -72,8 +145,19 @@ class DisabledPhotoStorage implements PhotoStorage {
   async delete(): Promise<void> {}
 }
 
-export const photoStorage: PhotoStorage =
-  env.PHOTO_STORAGE_DRIVER === 'local' ? new LocalPhotoStorage(env.photoStorageDir) : new DisabledPhotoStorage();
+function createPhotoStorage(): PhotoStorage {
+  switch (env.PHOTO_STORAGE_DRIVER) {
+    case 'local':
+      return new LocalPhotoStorage(env.photoStorageDir);
+    case 'supabase':
+      // Presence is guaranteed by the env schema.
+      return new SupabasePhotoStorage(env.SUPABASE_URL!, env.SUPABASE_SERVICE_ROLE_KEY!, env.SUPABASE_STORAGE_BUCKET);
+    default:
+      return new DisabledPhotoStorage();
+  }
+}
+
+export const photoStorage: PhotoStorage = createPhotoStorage();
 
 export function photoKey(studentId: string, ext: 'jpg' | 'png' | 'webp'): string {
   return `${studentId}/${crypto.randomUUID()}.${ext}`;

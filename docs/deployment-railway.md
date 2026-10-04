@@ -29,8 +29,9 @@ Do not set `NPM_CONFIG_PRODUCTION=true` / `--omit=dev` for the build: the client
 | `APP_ORIGIN` | optional — defaults to `https://${RAILWAY_PUBLIC_DOMAIN}`; set it if you use a custom domain |
 | `ADMIN_BOOTSTRAP_EMAIL` | `admin@gradtwin.com` |
 | `ADMIN_BOOTSTRAP_PASSWORD` | strong temporary password (first deploy only; remove afterwards) |
-| `PHOTO_STORAGE_DRIVER` | `local` (or `disabled` to store no photos) |
-| `PHOTO_STORAGE_DIR` | `/data/identity-photos` |
+| `PHOTO_STORAGE_DRIVER` | `supabase` (recommended — allows several replicas), `local` (Railway Volume, one replica only) or `disabled` |
+| `SUPABASE_URL` / `SUPABASE_SERVICE_ROLE_KEY` | required for `supabase`: Supabase → Project Settings → API. Server-side secret. Create a **private** bucket `identity-photos` first (or set `SUPABASE_STORAGE_BUCKET`). |
+| `PHOTO_STORAGE_DIR` | `local` only: `/data/identity-photos` (the volume mount) |
 
 `PORT` and `RAILWAY_PUBLIC_DOMAIN` are provided by Railway.
 
@@ -48,7 +49,7 @@ Create migrations locally with `npm run db:migrate -- --name <change>`, commit `
 
 ## 5. Scaling note
 
-The app is designed for **one replica**: background jobs, in-memory rate limits and the local photo volume assume a single instance. A campus drive of several hundred concurrent students is well within one instance; if you need more replicas, move rate limiting to a shared store, run the sweeper on one instance only, and switch photos to object storage (implement another `PhotoStorage` driver in `server/src/lib/storage.ts`).
+With `PHOTO_STORAGE_DRIVER=supabase` (no volume) the service can run **several replicas**: all state is in PostgreSQL, the sweeper claims rows with `SKIP LOCKED`, the outage-detection clock is shared, and in-memory rate limits simply become per replica. Two replicas are recommended for a drive (availability, not CPU). With the `local` driver and a volume, stay at one replica. See the README §3.
 
 ## 6. Backups & restore
 

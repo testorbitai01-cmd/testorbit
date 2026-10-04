@@ -32,8 +32,18 @@ const envSchema = z.object({
   TRUST_PROXY: z.coerce.number().int().min(0).max(10).default(0),
   DATABASE_URL: z.string().min(1, 'DATABASE_URL is required'),
   SESSION_SECRET: z.string().min(32, 'SESSION_SECRET must be at least 32 characters'),
-  PHOTO_STORAGE_DRIVER: z.enum(['local', 'disabled']).default('local'),
+  PHOTO_STORAGE_DRIVER: z.enum(['local', 'supabase', 'disabled']).default('local'),
   PHOTO_STORAGE_DIR: z.string().default('./storage/identity-photos'),
+  // Supabase Storage (PHOTO_STORAGE_DRIVER=supabase). Server-side only — the service-role key
+  // bypasses Storage policies and must never reach the browser.
+  SUPABASE_URL: z.url().optional(),
+  SUPABASE_SERVICE_ROLE_KEY: z.string().min(20).optional(),
+  SUPABASE_STORAGE_BUCKET: z.string().regex(/^[a-z0-9][a-z0-9._-]{1,62}$/, 'lowercase letters, digits, . _ -').default('identity-photos'),
+}).superRefine((v, ctx) => {
+  if (v.PHOTO_STORAGE_DRIVER !== 'supabase') return;
+  for (const key of ['SUPABASE_URL', 'SUPABASE_SERVICE_ROLE_KEY'] as const) {
+    if (!v[key]) ctx.addIssue({ code: 'custom', path: [key], message: 'required when PHOTO_STORAGE_DRIVER=supabase' });
+  }
 });
 
 const parsed = envSchema.safeParse(process.env);
