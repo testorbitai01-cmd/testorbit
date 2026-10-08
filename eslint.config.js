@@ -4,7 +4,7 @@ import globals from 'globals';
 import tseslint from 'typescript-eslint';
 
 export default tseslint.config(
-  { ignores: ['**/dist/**', '**/node_modules/**', '**/coverage/**', 'prisma/migrations/**', 'client/public/mediapipe/**'] },
+  { ignores: ['**/dist/**', '**/dist-server/**', '**/node_modules/**', '**/coverage/**', 'prisma/migrations/**', 'client/public/mediapipe/**'] },
   js.configs.recommended,
   ...tseslint.configs.recommended,
   {
@@ -16,7 +16,7 @@ export default tseslint.config(
     },
   },
   {
-    files: ['client/**/*.{ts,tsx}'],
+    files: ['client/**/*.{ts,tsx}', 'yukti-agent/src/**/*.{ts,tsx}'],
     languageOptions: { globals: globals.browser },
     plugins: { 'react-hooks': reactHooks },
     rules: {
@@ -25,7 +25,7 @@ export default tseslint.config(
     },
   },
   {
-    files: ['server/**/*.ts', 'prisma/**/*.ts', 'shared/**/*.ts', '*.js', 'client/scripts/**/*.mjs'],
+    files: ['server/**/*.ts', 'prisma/**/*.ts', 'shared/**/*.ts', '*.js', 'client/scripts/**/*.mjs', 'yukti-agent/server/**/*.ts', 'yukti-agent/common/**/*.ts', 'yukti-agent/*.ts'],
     languageOptions: { globals: globals.node },
   },
 );

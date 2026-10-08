@@ -9,7 +9,8 @@
     "start": "node dist/index.js",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
-    "admin:bootstrap": "tsx src/scripts/bootstrapAdmin.ts"
+    "admin:bootstrap": "tsx src/scripts/bootstrapAdmin.ts",
+    "admin:reset-password": "tsx src/scripts/resetAdminPassword.ts"
   },
   "dependencies": {
     "@test-orbit/shared": "*",

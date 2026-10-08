@@ -23,6 +23,7 @@
     "db:deploy": "prisma migrate deploy",
     "db:seed": "prisma db seed",
     "admin:bootstrap": "npm run admin:bootstrap -w server",
+    "admin:reset-password": "npm run admin:reset-password -w server --",
     "railway:release": "prisma migrate deploy && prisma db seed && npm run admin:bootstrap",
     "db:export": "tsx scripts/export-data.ts",
     "db:import": "tsx scripts/import-data.ts",
